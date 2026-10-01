@@ -5,7 +5,7 @@ const elements = new Map();
 const document = {
   addEventListener() {},
   querySelector(selector) {
-    if (!elements.has(selector)) elements.set(selector, {innerHTML:'',textContent:'',className:'',close(){},focus(){}});
+    if (!elements.has(selector)) elements.set(selector, {innerHTML:'',textContent:'',className:'',close(){},showModal(){},focus(){}});
     return elements.get(selector);
   },
 };
@@ -50,5 +50,58 @@ assert.ok(!markdown('[bad](javascript:alert(1))').includes('<a'));
 assert.ok(!markdown('![bad](data:text/html,evil)').includes('<img'));
 assert.ok(!markdown('<script>alert(1)</script>').includes('<script>'));
 assert.ok(!markdown('![x](https://a.test/" onerror="evil)').includes('<img'));
+data.settings.currency='CHF';
+data.fx={rates:{EUR:'1',CHF:'0.95',USD:'1.10',GBP:'0.80',JPY:'160'},dates:{CHF:'2026-10-01',USD:'2026-10-01'},error:''};
+data.students[0].currency='EUR';
+data.lessons[0].currency='USD';
+data.packs[0].currency='GBP';
+data.payments[0].currency='USD';data.payments[1].currency='GBP';
+assert.equal(convert(11000,'USD'),9500);
+assert.equal(convert(100,'EUR','JPY'),16000);
+assert.equal(convert(1234,'EUR','JPY'),197400);
+assert.equal(convert(1234,'CHF','CHF'),1234);
+assert.equal(convert(1,'EUR','USD'),1);
+data.fx.rates.USD='1.005';
+assert.equal(convert(100,'EUR','USD'),101);
+data.fx.rates.USD='1.10';
+assert.equal(balance(1),3455);
+assert.equal(convertedTotal(data.payments,'amount'),19540);
+assert.ok(originalBalances(1).includes('USD'));
+assert.ok(chargeTable(charges()).includes('USD'));
+assert.ok(chargeTable(charges()).includes('GBP'));
+assert.ok(chargeTable(charges()).includes('≈'));
+for(const key of ['overview','accounts','students','packs','settings']){route=key;selectedStudent=null;render();assert.ok(!document.querySelector('#app').innerHTML.includes('NaN'));}
+delete data.fx.rates.USD;
+assert.equal(balance(1),null);
+assert.equal(convertedTotal(data.payments,'amount'),null);
+assert.equal(convert(0,'USD'),0);
+assert.equal(convert(1234,'USD','USD'),1234);
+assert.ok(money(balance(1)).includes('unavailable'));
+data.fx.error='Could not refresh';
+assert.ok(fxNotice().includes('Could not refresh'));
+assert.ok(chargeTable(charges()).includes('USD'));
 console.log('Frontend checks passed: empty and populated screens, billing totals, pack usage, note formatting, safe links, and form actions.');
 `,context);
+
+Promise.resolve(vm.runInContext(`(async()=>{
+ data.lessons=[
+  {id:1,student_id:1,title:'Weekly',series_id:'one',start:'2026-10-01T10:00',status:'scheduled'},
+  {id:2,student_id:1,title:'Weekly',series_id:'one',start:'2026-10-08T10:00',status:'scheduled'},
+  {id:3,student_id:1,title:'Weekly',series_id:'one',start:'2026-10-15T10:00',status:'completed'},
+  {id:4,student_id:1,title:'Weekly',series_id:'other',start:'2026-10-22T10:00',status:'scheduled'}
+ ];
+ assert.equal(followingLessons(data.lessons[0]).length,1);
+ for(const [buttonId,expected] of [['scope-single','single'],['scope-following','following'],['scope-back',null]]){
+  const response=chooseLessonScope(data.lessons[0]);
+  assert.ok(document.querySelector('#scope-dialog').innerHTML.includes('1 later planned lesson'));
+  document.querySelector('#'+buttonId).onclick();
+  assert.equal(await response,expected);
+ }
+ const cancelled=chooseLessonScope(data.lessons[0]);
+ document.querySelector('#scope-dialog').oncancel({preventDefault(){}});
+ assert.equal(await cancelled,null);
+ const alone=chooseLessonScope(data.lessons[3]);
+ assert.ok(document.querySelector('#scope-dialog').innerHTML.includes('id="scope-following" disabled'));
+ document.querySelector('#scope-back').onclick();await alone;
+ console.log('Edit-scope popup checks passed: yes, no, back, Escape, and series targeting.');
+})()`,context)).catch(error=>{console.error(error);process.exitCode=1;});

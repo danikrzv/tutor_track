@@ -2,7 +2,7 @@
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import argparse
 import base64
@@ -15,6 +15,23 @@ import sqlite3
 import tempfile
 import uuid
 import zipfile
+import threading
+import time
+from urllib.request import urlopen, Request
+
+CURRENCIES = {
+    'CHF':'Swiss franc','EUR':'Euro','USD':'US dollar','GBP':'British pound',
+    'CAD':'Canadian dollar','AUD':'Australian dollar','NZD':'New Zealand dollar',
+    'PLN':'Polish zloty','CZK':'Czech koruna','DKK':'Danish krone','NOK':'Norwegian krone',
+    'SEK':'Swedish krona','RON':'Romanian leu','HUF':'Hungarian forint',
+    'JPY':'Japanese yen','KRW':'South Korean won','CNY':'Chinese yuan',
+    'HKD':'Hong Kong dollar','SGD':'Singapore dollar','INR':'Indian rupee',
+    'BRL':'Brazilian real','MXN':'Mexican peso','ZAR':'South African rand',
+    'TRY':'Turkish lira','AED':'UAE dirham','ILS':'Israeli shekel',
+    'MYR':'Malaysian ringgit','THB':'Thai baht','PHP':'Philippine peso',
+    'IDR':'Indonesian rupiah','UAH':'Ukrainian hryvnia','RUB':'Russian ruble',
+}
+FX_LOCK = threading.Lock()
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('TUTORTRACK_DATA', ROOT / 'data')).resolve()
@@ -50,7 +67,11 @@ CREATE TABLE IF NOT EXISTS notes (
  body TEXT NOT NULL DEFAULT '', updated TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS exchange_rates (
+ currency TEXT PRIMARY KEY, rate TEXT NOT NULL, date TEXT NOT NULL
+);
 INSERT OR IGNORE INTO settings VALUES ('currency','CHF');
+INSERT OR IGNORE INTO settings VALUES ('time_format','24');
 CREATE INDEX IF NOT EXISTS idx_lessons_student ON lessons(student_id);
 CREATE INDEX IF NOT EXISTS idx_lessons_pack ON lessons(pack_id);
 CREATE INDEX IF NOT EXISTS idx_payments_lesson ON payments(lesson_id);
@@ -73,6 +94,95 @@ def initialize():
     (DATA / 'uploads').mkdir(exist_ok=True)
     with database() as db:
         db.executescript(SCHEMA)
+        missing = [table for table in ('students','lessons','packs','payments')
+                   if 'currency' not in {r['name'] for r in db.execute(f'PRAGMA table_info({table})')}]
+        if missing:
+            # Preserve existing records before the one-time currency migration.
+            if db.execute('SELECT COUNT(*) FROM students').fetchone()[0]:
+                backup = sqlite3.connect(DATA / f'before-currencies-{uuid.uuid4().hex}.sqlite3')
+                try:
+                    db.backup(backup)
+                finally:
+                    backup.close()
+            db.execute('BEGIN IMMEDIATE')
+            original = db.execute("SELECT value FROM settings WHERE key='currency'").fetchone()[0]
+            for table in missing:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN currency TEXT NOT NULL DEFAULT 'CHF'")
+                db.execute(f'UPDATE {table} SET currency=?',(original,))
+
+        if 'series_id' not in {r['name'] for r in db.execute('PRAGMA table_info(lessons)')}:
+            db.execute('ALTER TABLE lessons ADD COLUMN series_id TEXT')
+            # Older weekly batches were inserted consecutively with identical details.
+            previous = None
+            key_fields = ('student_id','title','minutes','rate','amount','pack_id','location','currency')
+            for item in list(db.execute('SELECT * FROM lessons ORDER BY id')):
+                current = dict(item)
+                if previous and current['id'] == previous['id']+1 and all(current[k] == previous[k] for k in key_fields) and datetime.fromisoformat(current['start'])-datetime.fromisoformat(previous['start']) == timedelta(weeks=1):
+                    series = previous.get('series_id') or uuid.uuid4().hex
+                    db.execute('UPDATE lessons SET series_id=? WHERE id IN (?,?)',(series,previous['id'],current['id']))
+                    current['series_id'] = series
+                previous = current
+        db.execute('CREATE INDEX IF NOT EXISTS idx_lessons_series ON lessons(series_id)')
+
+def currency_code(value):
+    code = str(value).upper()
+    if code not in CURRENCIES:
+        raise ValueError('Choose one of the supported currencies.')
+    return code
+
+def exchange_state(db):
+    settings = dict(db.execute('SELECT key,value FROM settings'))
+    entries = list(db.execute('SELECT * FROM exchange_rates'))
+    return {'base':'EUR', 'rates':{'EUR':'1', **{r['currency']:r['rate'] for r in entries}},
+            'dates':{r['currency']:r['date'] for r in entries},
+            'checked_at':settings.get('fx_checked_at'), 'error':settings.get('fx_error',''),
+            'source':'Frankfurter'}
+
+def refresh_rates(force=False):
+    # Only public currency codes leave the computer, never student or payment data.
+    with FX_LOCK:
+        with database() as db:
+            settings = dict(db.execute('SELECT key,value FROM settings'))
+            interval = 600 if settings.get('fx_error') else 21600
+            if not force and time.time()-float(settings.get('fx_attempt','0')) < interval:
+                return exchange_state(db)
+        try:
+            quotes = ','.join(c.lower() for c in CURRENCIES if c != 'EUR')
+            request = Request('https://api.frankfurter.dev/v2/rates?base=eur&quotes='+quotes,
+                              headers={'Accept':'application/json','User-Agent':'TutorTrack/1.0'})
+            with urlopen(request, timeout=12) as response:
+                rows = json.loads(response.read(1_000_000))
+            validated = {}
+            if not isinstance(rows,list):
+                raise ValueError('Invalid rates response')
+            for entry in rows:
+                code = currency_code(entry['quote'])
+                rate = Decimal(str(entry['rate']))
+                date = datetime.strptime(entry['date'],'%Y-%m-%d').date()
+                if entry['base'] != 'EUR' or not rate.is_finite() or rate <= 0 or date > datetime.now().date()+timedelta(days=1):
+                    raise ValueError('Invalid rate')
+                validated[code] = (code,str(rate),date.isoformat())
+            if set(validated) != set(CURRENCIES)-{'EUR'}:
+                raise ValueError('Incomplete rates response')
+            with database() as db:
+                db.executemany('INSERT INTO exchange_rates VALUES (?,?,?) ON CONFLICT(currency) DO UPDATE SET rate=excluded.rate,date=excluded.date',validated.values())
+                db.executemany('INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                               [('fx_checked_at',datetime.now().isoformat(timespec='seconds')),('fx_error',''),('fx_attempt',str(time.time()))])
+                return exchange_state(db)
+        except (OSError,ValueError,KeyError,TypeError,InvalidOperation):
+            with database() as db:
+                db.executemany('INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                               [('fx_error','Could not refresh exchange rates. Cached rates are shown where available.'),('fx_attempt',str(time.time()))])
+                return exchange_state(db)
+
+def converted(amount, source, target, fx):
+    if source == target or amount == 0:
+        return amount
+    if source not in fx['rates'] or target not in fx['rates']:
+        return None
+    value = Decimal(amount)*Decimal(fx['rates'][target])/Decimal(fx['rates'][source])
+    unit = Decimal('100') if target in ('JPY','KRW') else Decimal('1')
+    return int((value/unit).quantize(Decimal('1'),rounding=ROUND_HALF_UP)*unit)
 
 def required(value, label, limit=300):
     value = str(value or '').strip()
@@ -89,14 +199,16 @@ def integer(value, label, minimum=1, maximum=10000):
     except (ValueError, TypeError):
         raise ValueError(f'{label} must be a whole number from {minimum} to {maximum}.')
 
-def money(value):
+def money(value, currency=None):
     try:
         amount = Decimal(str(value))
         if not amount.is_finite() or amount < 0 or amount > 1000000 or amount.as_tuple().exponent < -2:
             raise ValueError()
+        if currency in ('JPY','KRW') and amount != amount.to_integral_value():
+            raise ValueError()
         return int(amount * 100)
     except (InvalidOperation, TypeError, ValueError):
-        raise ValueError('Enter a positive amount with at most two decimal places.')
+        raise ValueError('Enter a nonnegative amount with '+('no decimal places.' if currency in ('JPY','KRW') else 'at most two decimal places.'))
 
 def row(db, table, identifier):
     found = db.execute(f'SELECT * FROM {table} WHERE id=?', (identifier,)).fetchone()
@@ -107,6 +219,108 @@ def row(db, table, identifier):
 def state(db):
     result = {table: [dict(r) for r in db.execute(f'SELECT * FROM {table} ORDER BY id')] for table in ('students','lessons','packs','payments','notes')}
     result['settings'] = dict(db.execute('SELECT key,value FROM settings'))
+    result['currencies'] = CURRENCIES
+    result['fx'] = exchange_state(db)
+    return result
+
+def save_lesson(db, data, ignore_ids=()):
+    result = {}
+    old = row(db,'lessons',data['id']) if data.get('id') else None
+    if old and old['status'] != 'scheduled':
+        raise ValueError('Only scheduled lessons can be edited.')
+    student = row(db,'students',data.get('student_id'))
+    if student['archived']:
+        raise ValueError('Restore this student before scheduling a lesson.')
+    minutes = integer(data.get('minutes'),'Duration',5,720)
+    try:
+        start = datetime.fromisoformat(data.get('start',''))
+        if start.tzinfo or start.year < 2000 or start.year > 2100:
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise ValueError('Choose a valid local lesson date and time (2000–2100).')
+    start_string = start.isoformat(timespec='minutes')
+    repeat_count = integer(data.get('repeat_count',1),'Number of weekly lessons',1,52)
+    starts = [start+timedelta(weeks=week) for week in range(repeat_count)]
+    if starts[-1].year > 2100:
+        raise ValueError('All lessons must be scheduled by the end of 2100.')
+    # Compare interval endpoints rather than rounded time slots.
+    for lesson in db.execute("SELECT * FROM lessons WHERE status != 'cancelled' AND id != ?", (old['id'] if old else -1,)):
+        if lesson['id'] in ignore_ids:
+            continue
+        other = datetime.fromisoformat(lesson['start'])
+        for occurrence in starts:
+            difference = (occurrence-other).total_seconds()/60
+            if difference < lesson['minutes'] and difference > -minutes:
+                raise ValueError(f'The lesson on {occurrence:%Y-%m-%d at %H:%M} overlaps another lesson. No changes were saved. Choose a different time or fewer weeks.')
+    pack_id = data.get('pack_id') or None
+    if pack_id:
+        pack = row(db,'packs',pack_id)
+        used = sum(1 for item in db.execute("SELECT id FROM lessons WHERE pack_id=? AND status != 'cancelled' AND id != ?", (pack_id,old['id'] if old else -1)) if item['id'] not in ignore_ids)
+        if pack['student_id'] != student['id'] or pack['minutes'] != minutes:
+            raise ValueError('The pack must belong to this student and match the lesson duration.')
+        if used+repeat_count > pack['quantity']:
+            raise ValueError(f'This pack has {pack["quantity"]-used} available sessions, but this schedule needs {repeat_count}. Choose fewer weeks or a different pack.')
+    currency = pack['currency'] if pack_id else (old['currency'] if old and old['student_id'] == student['id'] else student['currency'])
+    default_rate = old['rate'] if old and old['student_id'] == student['id'] else student['rate']
+    rate = 0 if pack_id else money(data.get('rate',str(Decimal(default_rate)/100)),currency)
+    amount = 0 if pack_id else int((Decimal(rate)*minutes/60).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+    if currency in ('JPY','KRW'):
+        amount = int((Decimal(amount)/100).quantize(Decimal('1'),rounding=ROUND_HALF_UP)*100)
+    values = (student['id'], required(data.get('title'),'Lesson title'), start_string,minutes,rate,amount,pack_id,str(data.get('location',''))[:300],currency)
+    if old:
+        db.execute('UPDATE lessons SET student_id=?,title=?,start=?,minutes=?,rate=?,amount=?,pack_id=?,location=?,currency=? WHERE id=?', (*values,old['id']))
+        db.execute('UPDATE notes SET student_id=? WHERE lesson_id=?',(student['id'],old['id']))
+        result['id'] = old['id']
+    else:
+        result['id'] = db.execute("INSERT INTO lessons(student_id,title,start,minutes,rate,amount,pack_id,location,currency,status) VALUES (?,?,?,?,?,?,?,?,?,'scheduled')",values).lastrowid
+    result['ids'] = [result['id']]
+    for occurrence in starts[1:]:
+        repeated = (*values[:2],occurrence.isoformat(timespec='minutes'),*values[3:])
+        result['ids'].append(db.execute("INSERT INTO lessons(student_id,title,start,minutes,rate,amount,pack_id,location,currency,status) VALUES (?,?,?,?,?,?,?,?,?,'scheduled')",repeated).lastrowid)
+    result['count'] = repeat_count
+    if repeat_count > 1:
+        series = old.get('series_id') if old else None
+        series = series or uuid.uuid4().hex
+        db.executemany('UPDATE lessons SET series_id=? WHERE id=?',[(series,identifier) for identifier in result['ids']])
+    return result
+
+def edit_following_lessons(db, data):
+    original = row(db,'lessons',data.get('id'))
+    if original['status'] != 'scheduled':
+        raise ValueError('Only planned lessons can be edited.')
+    if integer(data.get('repeat_count',1),'Number of weekly lessons',1,52) != 1:
+        raise ValueError('Edit the existing series separately from adding more weekly lessons.')
+    if not original['series_id']:
+        return save_lesson(db,data)
+    targets = [dict(r) for r in db.execute("SELECT * FROM lessons WHERE series_id=? AND status='scheduled' AND start>=? ORDER BY start,id",(original['series_id'],original['start']))]
+    ids = {r['id'] for r in targets}
+    # Normalize through the same validation used for individual lessons.
+    result = save_lesson(db,data,ids)
+    updated = row(db,'lessons',original['id'])
+    delta = datetime.fromisoformat(updated['start'])-datetime.fromisoformat(original['start'])
+    changes = {key:updated[key] for key in ('student_id','title','minutes','rate','pack_id','location') if updated[key] != original[key]}
+    for target in targets:
+        if target['id'] == original['id']:
+            continue
+        payload = {**target,**changes,'repeat_count':1}
+        payload['start'] = (datetime.fromisoformat(target['start'])+delta).isoformat(timespec='minutes')
+        payload['rate'] = str(Decimal(payload['rate'])/100)
+        # A common numeric rate must not silently relabel a different currency.
+        if 'rate' in changes and target['currency'] != original['currency'] and 'student_id' not in changes and 'pack_id' not in changes:
+            raise ValueError('These lessons use different currencies. Edit their rates individually.')
+        save_lesson(db,payload,ids)
+    planned = [row(db,'lessons',identifier) for identifier in ids]
+    for index,lesson in enumerate(planned):
+        start = datetime.fromisoformat(lesson['start'])
+        for other in planned[index+1:]:
+            difference = (start-datetime.fromisoformat(other['start'])).total_seconds()/60
+            if difference < other['minutes'] and difference > -lesson['minutes']:
+                raise ValueError('The updated lessons would overlap each other. No changes were saved.')
+    for pack_id in {l['pack_id'] for l in planned if l['pack_id']}:
+        used = db.execute("SELECT COUNT(*) FROM lessons WHERE pack_id=? AND status!='cancelled'",(pack_id,)).fetchone()[0]
+        if used > row(db,'packs',pack_id)['quantity']:
+            raise ValueError('The pack does not have enough sessions for all these lessons. No changes were saved.')
+    result['updated_count'] = len(ids)
     return result
 
 def write(action, data):
@@ -114,56 +328,23 @@ def write(action, data):
         db.execute('BEGIN IMMEDIATE')
         result = {}
         if action == 'student':
-            values = (required(data.get('name'), 'Name'), str(data.get('subject',''))[:300], str(data.get('email',''))[:300], str(data.get('phone',''))[:100], money(data.get('rate')), data.get('color') if data.get('color') in ('purple','blue','orange','green','pink') else 'purple', str(data.get('details',''))[:10000], int(bool(data.get('archived',False))))
+            old = row(db,'students',data['id']) if data.get('id') else None
+            default = old['currency'] if old else db.execute("SELECT value FROM settings WHERE key='currency'").fetchone()[0]
+            currency = currency_code(data.get('currency',default))
+            values = (required(data.get('name'), 'Name'), str(data.get('subject',''))[:300], str(data.get('email',''))[:300], str(data.get('phone',''))[:100], money(data.get('rate'),currency), data.get('color') if data.get('color') in ('purple','blue','orange','green','pink') else 'purple', str(data.get('details',''))[:10000], int(bool(data.get('archived',False))), currency)
             if data.get('id'):
                 row(db,'students',data['id'])
-                db.execute('UPDATE students SET name=?,subject=?,email=?,phone=?,rate=?,color=?,details=?,archived=? WHERE id=?', (*values, data['id']))
+                db.execute('UPDATE students SET name=?,subject=?,email=?,phone=?,rate=?,color=?,details=?,archived=?,currency=? WHERE id=?', (*values, data['id']))
                 result['id'] = data['id']
             else:
-                result['id'] = db.execute('INSERT INTO students(name,subject,email,phone,rate,color,details,archived) VALUES (?,?,?,?,?,?,?,?)', values).lastrowid
+                result['id'] = db.execute('INSERT INTO students(name,subject,email,phone,rate,color,details,archived,currency) VALUES (?,?,?,?,?,?,?,?,?)', values).lastrowid
         elif action == 'pack':
             student = row(db,'students',data.get('student_id'))
             if student['archived']:
                 raise ValueError('Restore this student before adding a pack.')
-            result['id'] = db.execute('INSERT INTO packs(student_id,name,quantity,minutes,price,created) VALUES (?,?,?,?,?,?)', (student['id'], required(data.get('name'),'Pack name'), integer(data.get('quantity'),'Number of lessons',1,1000), integer(data.get('minutes'),'Duration',5,720), money(data.get('price')), datetime.now().isoformat(timespec='seconds'))).lastrowid
+            result['id'] = db.execute('INSERT INTO packs(student_id,name,quantity,minutes,price,created,currency) VALUES (?,?,?,?,?,?,?)', (student['id'], required(data.get('name'),'Pack name'), integer(data.get('quantity'),'Number of lessons',1,1000), integer(data.get('minutes'),'Duration',5,720), money(data.get('price'),student['currency']), datetime.now().isoformat(timespec='seconds'),student['currency'])).lastrowid
         elif action == 'lesson':
-            old = row(db,'lessons',data['id']) if data.get('id') else None
-            if old and old['status'] != 'scheduled':
-                raise ValueError('Only scheduled lessons can be edited.')
-            student = row(db,'students',data.get('student_id'))
-            if student['archived']:
-                raise ValueError('Restore this student before scheduling a lesson.')
-            minutes = integer(data.get('minutes'),'Duration',5,720)
-            try:
-                start = datetime.fromisoformat(data.get('start',''))
-                if start.tzinfo or start.year < 2000 or start.year > 2100:
-                    raise ValueError()
-            except (ValueError, TypeError):
-                raise ValueError('Choose a valid local lesson date and time (2000–2100).')
-            start_string = start.isoformat(timespec='minutes')
-            # Compare interval endpoints rather than rounded time slots.
-            for lesson in db.execute("SELECT * FROM lessons WHERE status != 'cancelled' AND id != ?", (old['id'] if old else -1,)):
-                other = datetime.fromisoformat(lesson['start'])
-                difference = (start-other).total_seconds()/60
-                if difference < lesson['minutes'] and difference > -minutes:
-                    raise ValueError('This time overlaps another lesson. Choose a different time.')
-            pack_id = data.get('pack_id') or None
-            if pack_id:
-                pack = row(db,'packs',pack_id)
-                used = db.execute("SELECT COUNT(*) FROM lessons WHERE pack_id=? AND status != 'cancelled' AND id != ?", (pack_id,old['id'] if old else -1)).fetchone()[0]
-                if pack['student_id'] != student['id'] or pack['minutes'] != minutes:
-                    raise ValueError('The pack must belong to this student and match the lesson duration.')
-                if used >= pack['quantity']:
-                    raise ValueError('This pack has no unreserved lessons remaining.')
-            rate = money(data.get('rate',str(Decimal(student['rate'])/100)))
-            amount = 0 if pack_id else int((Decimal(rate)*minutes/60).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
-            values = (student['id'], required(data.get('title'),'Lesson title'), start_string,minutes,rate,amount,pack_id,str(data.get('location',''))[:300])
-            if old:
-                db.execute('UPDATE lessons SET student_id=?,title=?,start=?,minutes=?,rate=?,amount=?,pack_id=?,location=? WHERE id=?', (*values,old['id']))
-                db.execute('UPDATE notes SET student_id=? WHERE lesson_id=?',(student['id'],old['id']))
-                result['id'] = old['id']
-            else:
-                result['id'] = db.execute("INSERT INTO lessons(student_id,title,start,minutes,rate,amount,pack_id,location,status) VALUES (?,?,?,?,?,?,?,?,'scheduled')",values).lastrowid
+            result = edit_following_lessons(db,data) if data.get('edit_scope') == 'following' else save_lesson(db,data)
         elif action == 'lesson-status':
             lesson = row(db,'lessons',data.get('id'))
             status = data.get('status')
@@ -185,14 +366,14 @@ def write(action, data):
             column = kind+'_id'
             paid = db.execute(f'SELECT COALESCE(SUM(amount),0) FROM payments WHERE {column}=?',(item['id'],)).fetchone()[0]
             due = item['amount' if kind == 'lesson' else 'price']-paid
-            amount = money(data.get('amount'))
+            amount = money(data.get('amount'),item['currency'])
             if amount <= 0 or amount > due:
                 raise ValueError('Payment must be greater than zero and no more than the remaining balance.')
             try:
                 date = datetime.strptime(data.get('date',''),'%Y-%m-%d').date().isoformat()
             except (ValueError, TypeError):
                 raise ValueError('Choose a valid payment date.')
-            result['id'] = db.execute(f'INSERT INTO payments({column},amount,date,method) VALUES (?,?,?,?)',(item['id'],amount,date,required(data.get('method'),'Payment method',100))).lastrowid
+            result['id'] = db.execute(f'INSERT INTO payments({column},amount,date,method,currency) VALUES (?,?,?,?,?)',(item['id'],amount,date,required(data.get('method'),'Payment method',100),item['currency'])).lastrowid
         elif action == 'delete-payment':
             row(db,'payments',data.get('id'))
             db.execute('DELETE FROM payments WHERE id=?',(data['id'],))
@@ -216,13 +397,14 @@ def write(action, data):
             else:
                 result['id'] = db.execute('INSERT INTO notes(student_id,lesson_id,title,body,updated) VALUES (?,?,?,?,?)',values).lastrowid
         elif action == 'settings':
-            currency = str(data.get('currency','')).upper()
-            if currency not in ('CHF','EUR','USD','GBP','CAD','AUD'):
-                raise ValueError('Choose one of the supported currencies.')
-            current = db.execute("SELECT value FROM settings WHERE key='currency'").fetchone()[0]
-            if current != currency and any(db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] for table in ('lessons','packs','payments')):
-                raise ValueError('Currency is locked once lessons or packs exist, to keep your accounts consistent.')
-            db.execute("UPDATE settings SET value=? WHERE key='currency'",(currency,))
+            if 'currency' in data:
+                currency = currency_code(data['currency'])
+                db.execute("UPDATE settings SET value=? WHERE key='currency'",(currency,))
+            if 'time_format' in data:
+                time_format = str(data['time_format'])
+                if time_format not in ('12','24'):
+                    raise ValueError('Choose a 12-hour or 24-hour time format.')
+                db.execute("INSERT INTO settings(key,value) VALUES ('time_format',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(time_format,))
         else:
             raise ValueError('Unknown action.')
         return result
@@ -287,9 +469,16 @@ class Handler(BaseHTTPRequestHandler):
                     records = state(db)
                 output = io.StringIO()
                 writer = csv.writer(output)
-                writer.writerow(['Type','ID','Student','Description','Date','Charge','Received','Currency'])
+                writer.writerow(['Type','ID','Student','Description','Date','Charge','Received','Currency','Preferred currency','Converted charge','Converted received','Exchange rate','Rate dates'])
                 students = {s['id']:s['name'] for s in records['students']}
                 currency = records['settings']['currency']
+                fx = records['fx']
+                def conversion_columns(amount, source, payment=False):
+                    value = converted(amount,source,currency,fx)
+                    rate = '1' if source == currency else (str(Decimal(fx['rates'][currency])/Decimal(fx['rates'][source])) if source in fx['rates'] and currency in fx['rates'] else '')
+                    dates = ' / '.join(sorted({fx['dates'][c] for c in (source,currency) if c in fx['dates']})) if source != currency else ''
+                    formatted = f'{value/100:.2f}' if value is not None else ''
+                    return [currency,'' if payment else formatted,formatted if payment else '',rate,dates]
                 def safe(value):
                     value = str(value)
                     return "'"+value if value.startswith(('=','+','-','@','\t','\r')) else value
@@ -297,11 +486,11 @@ class Handler(BaseHTTPRequestHandler):
                     for item in items:
                         if kind == 'lesson' and (item['status'] != 'completed' or item['pack_id']):
                             continue
-                        writer.writerow([kind,item['id'],safe(students[item['student_id']]),safe(item.get('title',item.get('name'))),item.get('start',item.get('created'))[:10],f"{item.get('amount',item.get('price'))/100:.2f}",'',currency])
+                        writer.writerow([kind,item['id'],safe(students[item['student_id']]),safe(item.get('title',item.get('name'))),item.get('start',item.get('created'))[:10],f"{item.get('amount',item.get('price'))/100:.2f}",'',item['currency'],*conversion_columns(item.get('amount',item.get('price')),item['currency'])])
                 for payment in records['payments']:
                     kind = 'lesson' if payment['lesson_id'] else 'pack'
                     item = next(i for i in records['lessons' if kind == 'lesson' else 'packs'] if i['id'] == payment[kind+'_id'])
-                    writer.writerow(['payment',payment['id'],safe(students[item['student_id']]),safe(payment['method']),payment['date'],'',f"{payment['amount']/100:.2f}",currency])
+                    writer.writerow(['payment',payment['id'],safe(students[item['student_id']]),safe(payment['method']),payment['date'],'',f"{payment['amount']/100:.2f}",payment['currency'],*conversion_columns(payment['amount'],payment['currency'],True)])
                 self.send(200,'\ufeff'+output.getvalue(),'text/csv; charset=utf-8',{'Content-Disposition':'attachment; filename="tutortrack-accounts.csv"'})
             else:
                 if path.startswith('/uploads/'):
@@ -344,6 +533,8 @@ class Handler(BaseHTTPRequestHandler):
                 name = f'{uuid.uuid4().hex}.{extension}'
                 (DATA/'uploads'/name).write_bytes(content)
                 self.send(200,{'url':'/uploads/'+name})
+            elif self.path == '/api/refresh-rates':
+                self.send(200,refresh_rates(force=data.get('force') is True))
             elif self.path.startswith('/api/'):
                 self.send(200,write(self.path.removeprefix('/api/'),data))
             else:
