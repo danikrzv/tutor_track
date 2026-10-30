@@ -5,7 +5,7 @@ const elements = new Map();
 const document = {
   addEventListener() {},
   querySelector(selector) {
-    if (!elements.has(selector)) elements.set(selector, {innerHTML:'',textContent:'',className:'',close(){},showModal(){},focus(){}});
+    if (!elements.has(selector)) elements.set(selector, {querySelectorAll(){return [];},innerHTML:'',textContent:'',className:'',close(){},showModal(){},focus(){}});
     return elements.get(selector);
   },
 };
@@ -27,11 +27,16 @@ data.lessons=[
 ];
 data.packs=[{id:1,student_id:1,name:'3 lessons',quantity:3,minutes:60,price:15000,created:localDate()+'T09:00'}];
 data.payments=[{id:1,lesson_id:1,pack_id:null,amount:2000,date:localDate(),method:'Cash'},{id:2,lesson_id:null,pack_id:1,amount:15000,date:localDate(),method:'Transfer'}];
+data.payments.forEach(p=>p.student_id=1);
+data.billing={charges:[{...data.lessons[0],currency:'CHF',kind:'lesson',total:6000,paid:6000,credit_applied:4000,due:0,date:data.lessons[0].start},{...data.lessons[1],currency:'CHF',kind:'lesson',total:5000,paid:5000,credit_applied:5000,due:0,date:data.lessons[1].start}],accounts:[{student_id:1,currency:'CHF',billed:11000,received:17000,balance:-6000,credit:6000,due:0}]};
 data.notes=[{id:1,student_id:1,lesson_id:1,title:'Algebra notes',body:'# A goal',updated:localDate()+'T10:00'}];
 assert.equal(charges().length,2);
-assert.equal(balance(1),4000);
-assert.equal(packUsage(1).done,1);
-assert.equal(packUsage(1).reserved,1);
+assert.equal(balance(1),-6000);
+assert.equal(balanceLabel(1),'Credit available');
+assert.ok(balanceDisplay(1).includes('60.00'));
+assert.ok(packs().includes('Payment received'));
+assert.ok(!packs().includes('Schedule from pack'));
+assert.equal(charges().filter(c=>c.due>0).length,0);
 for(const key of ['overview','calendar','students','accounts','packs','notes','settings']){
  route=key;render();const html=document.querySelector('#app').innerHTML;
  assert.ok(!html.includes('undefined'),key+' should have complete values');
@@ -64,7 +69,13 @@ assert.equal(convert(1,'EUR','USD'),1);
 data.fx.rates.USD='1.005';
 assert.equal(convert(100,'EUR','USD'),101);
 data.fx.rates.USD='1.10';
-assert.equal(balance(1),3455);
+data.billing.accounts=[{student_id:1,currency:'USD',balance:4000,due:4000,credit:0},{student_id:1,currency:'GBP',balance:-15000,due:0,credit:15000}];
+data.billing.charges[0].currency='USD';data.billing.charges[1].currency='GBP';
+assert.equal(balance(1),3455-17813);
+assert.equal(convert(-11000,'USD'),-9500);
+assert.ok(balanceDisplay(1).includes('credit'));
+assert.ok(originalBalances(1).includes('due'));
+assert.ok(originalBalances(1).includes('credit'));
 assert.equal(convertedTotal(data.payments,'amount'),19540);
 assert.ok(originalBalances(1).includes('USD'));
 assert.ok(chargeTable(charges()).includes('USD'));
@@ -80,7 +91,7 @@ assert.ok(money(balance(1)).includes('unavailable'));
 data.fx.error='Could not refresh';
 assert.ok(fxNotice().includes('Could not refresh'));
 assert.ok(chargeTable(charges()).includes('USD'));
-console.log('Frontend checks passed: empty and populated screens, billing totals, pack usage, note formatting, safe links, and form actions.');
+console.log('Frontend checks passed: empty and populated screens, billing totals, student credit, note formatting, safe links, and form actions.');
 `,context);
 
 Promise.resolve(vm.runInContext(`(async()=>{
@@ -104,4 +115,34 @@ Promise.resolve(vm.runInContext(`(async()=>{
  assert.ok(document.querySelector('#scope-dialog').innerHTML.includes('id="scope-following" disabled'));
  document.querySelector('#scope-back').onclick();await alone;
  console.log('Edit-scope popup checks passed: yes, no, back, Escape, and series targeting.');
+ const originalDialog=showDialog,originalSubmit=submitForm,originalScope=chooseLessonScope;
+ let submitted;
+ showDialog=()=>{};
+ chooseLessonScope=()=>{throw Error('No future lessons exist, so this popup should not block scheduling.');};
+ const form=document.querySelector('#modal-form');
+ const submit={disabled:false,textContent:''};
+ form.querySelector=()=>submit;form.addEventListener=()=>{};form.dataset={};
+ document.querySelector('#rate-field label').firstChild={textContent:''};
+ submitForm=async(event,action,message,transform)=>{
+  submitted=transform(Object.fromEntries(Object.entries(form.elements).filter(([,input])=>!input.disabled).map(([key,input])=>[key,input.value])));
+ };
+ data.packs=[];data.settings.time_format='24';
+ for(const series of [null,'series-with-no-future-lessons']){
+  data.lessons=[{id:10,student_id:1,title:'Existing lesson',series_id:series,start:'2026-10-06T15:45',minutes:60,rate:6000,currency:'CHF',status:'scheduled'}];
+  form.elements=Object.fromEntries(Object.entries({id:'10',student_id:'1',title:'Existing lesson',lesson_date:'2026-10-06',lesson_hour:'15',lesson_minute:'45',minutes:'60',rate:'60',pack_id:'',location:'Online',repeat:'none',repeat_count:'4'}).map(([key,value])=>[key,{value,addEventListener(){}}]));
+  lessonForm({id:10});
+  form.elements.repeat.value='weekly';form.elements.repeat.onchange();
+  form.elements.repeat_count.value='6';form.elements.repeat_count.oninput();
+  assert.equal(form.elements.repeat_count.disabled,false);
+  assert.ok(submit.textContent.includes('schedule weekly'));
+  await form.onsubmit({preventDefault(){}});
+  assert.equal(submitted.id,'10');
+  assert.equal(submitted.repeat,'weekly');
+  assert.equal(submitted.repeat_count,'6');
+  assert.equal(submitted.start,'2026-10-06T15:45');
+  assert.equal(submitted.edit_scope,'single');
+ }
+ showDialog=originalDialog;submitForm=originalSubmit;chooseLessonScope=originalScope;
+ console.log('Existing lesson form checks passed: switching to weekly submits the selected date, time, and six weeks without a blocking scope popup.');
+
 })()`,context)).catch(error=>{console.error(error);process.exitCode=1;});

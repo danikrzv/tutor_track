@@ -21,3 +21,10 @@
 .repeat-section{padding:16px;margin-bottom:20px;border:1px solid #e6dfee;border-radius:9px;background:#fcfaff}.repeat-section>label{margin-bottom:0}.repeat-section #repeat-options{margin-top:18px}
 
 #scope-dialog{width:640px}.scope-actions{flex-wrap:wrap}
+
+/* Continuous calendar: the toolbar stays outside the scrolling date pane. */
+.calendar-scroll{position:relative;height:65vh;min-height:360px;max-height:900px;overflow:auto;overflow-anchor:none;overscroll-behavior:contain;scrollbar-gutter:stable}
+.calendar-scroll:focus-visible{outline:3px solid #b8a9f3;outline-offset:-3px}
+.calendar-period-title{margin:0;padding:14px 24px;background:#f8f7fc;color:var(--purple-dark);font-size:13px;border-top:1px solid var(--line)}
+.calendar-scroll .week-grid{min-height:360px}
+@media(max-width:700px){.calendar-scroll{height:65vh;min-height:320px}.calendar-scroll .week-grid{min-height:0}.calendar-period-title{padding:12px 15px}}

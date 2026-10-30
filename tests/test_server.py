@@ -75,6 +75,42 @@ class TutorTrackTests(unittest.TestCase):
         self.payment('lesson',response['ids'][1],'60')
         self.assertEqual([l['status'] for l in self.get()['lessons']],['scheduled','completed','scheduled','scheduled'])
 
+    def test_weekly_flag_creates_default_dates_and_extension_does_not_duplicate(self):
+        first = self.lesson(repeat='weekly')
+        rows = self.get()['lessons']
+        self.assertEqual(len(rows),4)
+        server.write('lesson-status', {'id':rows[1]['id'],'status':'cancelled'})
+        self.lesson(id=first,repeat='weekly',repeat_count=6)
+        self.assertEqual(len(self.get()['lessons']),6)
+        self.assertEqual(self.get()['lessons'][1]['status'],'cancelled')
+        self.lesson(id=first,repeat='weekly',repeat_count=6)
+        self.assertEqual(len(self.get()['lessons']),6)
+        self.assertEqual(len({l['start'] for l in self.get()['lessons']}),6)
+
+    def test_switch_existing_lesson_to_weekly_via_http(self):
+        first = self.lesson()
+        response = self.http('/api/lesson', {'id':str(first),'student_id':str(self.student),
+            'title':'Existing lesson','start':'2026-10-06T15:45','minutes':'60',
+            'rate':'60','repeat':'weekly','repeat_count':'6','edit_scope':'single'})
+        self.assertEqual(response['status'],200)
+        self.assertEqual(response['body']['created_count'],5)
+        lessons = self.get()['lessons']
+        self.assertEqual(lessons[0]['id'],first)
+        self.assertEqual([l['start'] for l in lessons],[
+            '2026-10-06T15:45','2026-10-13T15:45','2026-10-20T15:45',
+            '2026-10-27T15:45','2026-11-03T15:45','2026-11-10T15:45'])
+        self.assertTrue(all(l['status']=='scheduled' for l in lessons))
+        self.assertEqual(len({l['series_id'] for l in lessons}),1)
+
+    def test_edit_future_lessons_and_automatically_extend_weekly_schedule(self):
+        first = self.lesson(repeat_count=3)
+        self.lesson(id=first,start='2026-09-20T11:00',repeat='weekly',repeat_count=5,edit_scope='following')
+        rows = self.get()['lessons']
+        self.assertEqual(len(rows),5)
+        self.assertTrue(all(l['start'].endswith('T11:00') for l in rows))
+        self.assertEqual(rows[-1]['start'],'2026-10-18T11:00')
+        self.assertEqual(len({l['series_id'] for l in rows}),1)
+
     def test_weekly_conflict_preserves_existing_lesson_and_creates_nothing(self):
         original = self.lesson()
         self.lesson(start='2026-10-04T10:00')
@@ -86,16 +122,14 @@ class TutorTrackTests(unittest.TestCase):
             self.lesson(start='2026-09-27T10:00',repeat_count=3)
         self.assertEqual(self.get()['lessons'],before)
 
-    def test_weekly_pack_capacity_is_reserved_atomically(self):
+    def test_weekly_lessons_do_not_reserve_credit(self):
         pack = self.pack(quantity=3)
-        with self.assertRaisesRegex(ValueError,'3 available sessions'):
-            self.lesson(pack_id=pack,repeat_count=4)
-        self.assertEqual(self.get()['lessons'],[])
-        self.lesson(pack_id=pack,repeat_count=3)
-        self.assertEqual(len(self.get()['lessons']),3)
-        self.assertTrue(all(l['amount']==0 and l['pack_id']==pack for l in self.get()['lessons']))
-        with self.assertRaises(ValueError):
-            self.lesson(pack_id=pack,start='2026-11-01T10:00')
+        self.payment('pack',pack,'150')
+        self.lesson(repeat_count=4)
+        state = self.get()
+        self.assertEqual(len(state['lessons']),4)
+        self.assertTrue(all(l['amount']==6000 and l['pack_id'] is None for l in state['lessons']))
+        self.assertEqual(state['billing']['accounts'][0]['credit'],15000)
 
     def test_repeat_existing_lesson_and_count_validation(self):
         original = self.lesson()
@@ -152,16 +186,13 @@ class TutorTrackTests(unittest.TestCase):
         self.lesson(id=first,start='2026-09-27T10:00',edit_scope='following')
         self.assertEqual(self.get()['lessons'][2]['start'],'2026-10-11T10:00')
 
-    def test_series_pack_capacity_counts_all_targets(self):
+    def test_series_rejects_obsolete_pack_assignment_atomically(self):
         first = self.lesson(repeat_count=3)
         pack = self.pack(quantity=2)
         before = self.get()['lessons']
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError,'credit'):
             self.lesson(id=first,pack_id=pack,edit_scope='following')
         self.assertEqual(self.get()['lessons'],before)
-        enough = self.pack(quantity=3)
-        self.lesson(id=first,pack_id=enough,edit_scope='following')
-        self.assertTrue(all(l['pack_id']==enough for l in self.get()['lessons']))
 
     def test_legacy_weekly_series_linking_does_not_group_unrelated_lessons(self):
         first = self.lesson(repeat_count=3)
@@ -195,22 +226,19 @@ class TutorTrackTests(unittest.TestCase):
         server.write('lesson-status', {'id':lesson,'status':'scheduled'})
         self.assertEqual(self.get()['lessons'][0]['status'],'scheduled')
 
-    def test_pack_reservations_completion_and_cancellation(self):
+    def test_credit_completion_reopening_and_cancellation(self):
         pack = self.pack(quantity=1)
-        lesson = self.lesson(pack_id=pack)
-        with self.assertRaises(ValueError):
-            self.lesson(pack_id=pack,start='2026-09-21T10:00')
-        server.write('lesson-status', {'id':lesson,'status':'cancelled'})
-        second = self.lesson(pack_id=pack,start='2026-09-21T10:00')
-        server.write('lesson-status', {'id':second,'status':'completed'})
-        server.write('lesson-status', {'id':second,'status':'completed'})
         self.payment('pack',pack,'150')
-        with self.assertRaises(ValueError):
-            self.payment('lesson',second,'1')
-        self.assertEqual(self.get()['lessons'][1]['amount'],0)
+        lesson = self.lesson()
+        server.write('lesson-status', {'id':lesson,'status':'cancelled'})
+        second = self.lesson(start='2026-09-21T10:00')
+        server.write('lesson-status', {'id':second,'status':'completed'})
+        server.write('lesson-status', {'id':second,'status':'completed'})
+        self.assertEqual(self.get()['billing']['accounts'][0]['credit'],9000)
+        with self.assertRaises(ValueError): self.payment('lesson',second,'1')
+        server.write('lesson-status', {'id':second,'status':'scheduled'})
+        self.assertEqual(self.get()['billing']['accounts'][0]['credit'],15000)
         self.assertEqual(len(self.get()['payments']),1)
-        with self.assertRaises(ValueError):
-            self.lesson(pack_id=pack,start='2026-09-22T10:00')
 
     def test_pack_must_match_student_and_duration(self):
         pack = self.pack()
@@ -280,9 +308,9 @@ class TutorTrackTests(unittest.TestCase):
         self.payment('lesson',lesson,'20')
         self.payment('pack',pack,'100')
         self.lesson(start='2026-09-21T10:00')
-        self.lesson(pack_id=pack,start='2026-09-22T10:00')
+        self.lesson(start='2026-09-22T10:00')
         state = self.get()
-        self.assertEqual([l['currency'] for l in state['lessons']],['GBP','EUR','GBP'])
+        self.assertEqual([l['currency'] for l in state['lessons']],['GBP','EUR','EUR'])
         self.assertEqual([p['currency'] for p in state['payments']],['GBP','GBP'])
         self.assertEqual(state['packs'][0]['currency'],'GBP')
         self.assertEqual(state['students'][0]['currency'],'EUR')
@@ -376,7 +404,7 @@ class TutorTrackTests(unittest.TestCase):
     def test_export_accounts_without_double_counting_and_csv_injection(self):
         server.write('student', {'id':self.student,'name':'=DANGER()','rate':'60'})
         pack = self.pack()
-        bundled = self.lesson(pack_id=pack)
+        bundled = self.lesson()
         server.write('lesson-status', {'id':bundled,'status':'completed'})
         individual = self.lesson(start='2026-09-21T10:00')
         server.write('lesson-status', {'id':individual,'status':'completed'})

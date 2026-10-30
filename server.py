@@ -1,10 +1,12 @@
 """TutorTrack: a private, dependency-free local tutoring notebook."""
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import argparse
+from billing import ledger
+import hashlib
 import base64
 import csv
 import io
@@ -35,6 +37,10 @@ FX_LOCK = threading.Lock()
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('TUTORTRACK_DATA', ROOT / 'data')).resolve()
+
+def desktop_identity():
+    identity = str(ROOT.resolve())+'\n'+str(DATA.resolve())
+    return {'app':'TutorTrack','protocol':1,'project':hashlib.sha256(identity.encode()).hexdigest()}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS students (
@@ -123,6 +129,39 @@ def initialize():
                     current['series_id'] = series
                 previous = current
         db.execute('CREATE INDEX IF NOT EXISTS idx_lessons_series ON lessons(series_id)')
+    migrate_credit()
+
+def migrate_credit():
+    with database() as db:
+        db.execute('BEGIN IMMEDIATE')
+        if 'student_id' in {r['name'] for r in db.execute('PRAGMA table_info(payments)')}:
+            return
+        if db.execute('SELECT COUNT(*) FROM students').fetchone()[0]:
+            # A separate read connection snapshots the pre-migration DB while this
+            # connection holds the writer lock. Backing up an active write txn hangs.
+            with closing(sqlite3.connect(DATA/'tutortrack.sqlite3')) as source:
+                with closing(sqlite3.connect(DATA/f'before-credit-{uuid.uuid4().hex}.sqlite3')) as backup:
+                    source.backup(backup)
+        db.execute("""CREATE TABLE credit_payments (
+            id INTEGER PRIMARY KEY, student_id INTEGER NOT NULL REFERENCES students(id),
+            lesson_id INTEGER REFERENCES lessons(id), pack_id INTEGER REFERENCES packs(id),
+            amount INTEGER NOT NULL CHECK(amount>0), date TEXT NOT NULL, method TEXT NOT NULL,
+            currency TEXT NOT NULL, CHECK(lesson_id IS NULL OR pack_id IS NULL))""")
+        db.execute("""INSERT INTO credit_payments
+            SELECT p.id,COALESCE(l.student_id,k.student_id),p.lesson_id,p.pack_id,p.amount,p.date,p.method,p.currency
+            FROM payments p LEFT JOIN lessons l ON l.id=p.lesson_id LEFT JOIN packs k ON k.id=p.pack_id""")
+        db.execute('DROP TABLE payments')
+        db.execute('ALTER TABLE credit_payments RENAME TO payments')
+        db.execute('CREATE INDEX idx_payments_lesson ON payments(lesson_id)')
+        db.execute('CREATE INDEX idx_payments_pack ON payments(pack_id)')
+        if 'legacy_pack_id' not in {r['name'] for r in db.execute('PRAGMA table_info(lessons)')}:
+            db.execute('ALTER TABLE lessons ADD COLUMN legacy_pack_id INTEGER REFERENCES packs(id)')
+        for l in list(db.execute('SELECT l.*,p.price,p.quantity FROM lessons l JOIN packs p ON p.id=l.pack_id')):
+            unit = 100 if l['currency'] in ('JPY','KRW') else 1
+            amount = int((Decimal(l['price'])/l['quantity']/unit).quantize(Decimal('1'),rounding=ROUND_HALF_UP))*unit
+            rate = int((Decimal(amount)*60/l['minutes']/unit).quantize(Decimal('1'),rounding=ROUND_HALF_UP))*unit
+            db.execute('UPDATE lessons SET legacy_pack_id=pack_id,pack_id=NULL,amount=?,rate=? WHERE id=?',(amount,rate,l['id']))
+
 
 def currency_code(value):
     code = str(value).upper()
@@ -221,6 +260,7 @@ def state(db):
     result['settings'] = dict(db.execute('SELECT key,value FROM settings'))
     result['currencies'] = CURRENCIES
     result['fx'] = exchange_state(db)
+    result['billing'] = ledger(result)
     return result
 
 def save_lesson(db, data, ignore_ids=()):
@@ -239,10 +279,15 @@ def save_lesson(db, data, ignore_ids=()):
     except (ValueError, TypeError):
         raise ValueError('Choose a valid local lesson date and time (2000–2100).')
     start_string = start.isoformat(timespec='minutes')
-    repeat_count = integer(data.get('repeat_count',1),'Number of weekly lessons',1,52)
+    repeat_count = integer(data.get('repeat_count',4 if data.get('repeat') == 'weekly' else 1),'Number of weekly lessons',1,52)
     starts = [start+timedelta(weeks=week) for week in range(repeat_count)]
     if starts[-1].year > 2100:
         raise ValueError('All lessons must be scheduled by the end of 2100.')
+    # Reusing Repeat weekly fills missing dates; it never duplicates a series slot
+    # or restores a deliberately cancelled occurrence.
+    if old and old.get('series_id'):
+        existing = {r['start'] for r in db.execute('SELECT start FROM lessons WHERE series_id=? AND id!=?',(old['series_id'],old['id']))}
+        starts = [starts[0],*[date for date in starts[1:] if date.isoformat(timespec='minutes') not in existing]]
     # Compare interval endpoints rather than rounded time slots.
     for lesson in db.execute("SELECT * FROM lessons WHERE status != 'cancelled' AND id != ?", (old['id'] if old else -1,)):
         if lesson['id'] in ignore_ids:
@@ -252,20 +297,18 @@ def save_lesson(db, data, ignore_ids=()):
             difference = (occurrence-other).total_seconds()/60
             if difference < lesson['minutes'] and difference > -minutes:
                 raise ValueError(f'The lesson on {occurrence:%Y-%m-%d at %H:%M} overlaps another lesson. No changes were saved. Choose a different time or fewer weeks.')
-    pack_id = data.get('pack_id') or None
-    if pack_id:
-        pack = row(db,'packs',pack_id)
-        used = sum(1 for item in db.execute("SELECT id FROM lessons WHERE pack_id=? AND status != 'cancelled' AND id != ?", (pack_id,old['id'] if old else -1)) if item['id'] not in ignore_ids)
-        if pack['student_id'] != student['id'] or pack['minutes'] != minutes:
-            raise ValueError('The pack must belong to this student and match the lesson duration.')
-        if used+repeat_count > pack['quantity']:
-            raise ValueError(f'This pack has {pack["quantity"]-used} available sessions, but this schedule needs {repeat_count}. Choose fewer weeks or a different pack.')
-    currency = pack['currency'] if pack_id else (old['currency'] if old and old['student_id'] == student['id'] else student['currency'])
+    if data.get('pack_id'):
+        raise ValueError('Packs are now student credit. Reload and schedule a regular lesson.')
+    pack_id = None
+    currency = old['currency'] if old and old['student_id'] == student['id'] else student['currency']
     default_rate = old['rate'] if old and old['student_id'] == student['id'] else student['rate']
-    rate = 0 if pack_id else money(data.get('rate',str(Decimal(default_rate)/100)),currency)
-    amount = 0 if pack_id else int((Decimal(rate)*minutes/60).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+    rate = money(data.get('rate',str(Decimal(default_rate)/100)),currency)
+    amount = int((Decimal(rate)*minutes/60).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
     if currency in ('JPY','KRW'):
         amount = int((Decimal(amount)/100).quantize(Decimal('1'),rounding=ROUND_HALF_UP)*100)
+    if old and old.get('legacy_pack_id') and minutes == old['minutes'] and rate == old['rate'] and student['id'] == old['student_id']:
+        amount = old['amount']  # Preserve the agreed legacy pack price on date-only edits.
+
     values = (student['id'], required(data.get('title'),'Lesson title'), start_string,minutes,rate,amount,pack_id,str(data.get('location',''))[:300],currency)
     if old:
         db.execute('UPDATE lessons SET student_id=?,title=?,start=?,minutes=?,rate=?,amount=?,pack_id=?,location=?,currency=? WHERE id=?', (*values,old['id']))
@@ -277,7 +320,8 @@ def save_lesson(db, data, ignore_ids=()):
     for occurrence in starts[1:]:
         repeated = (*values[:2],occurrence.isoformat(timespec='minutes'),*values[3:])
         result['ids'].append(db.execute("INSERT INTO lessons(student_id,title,start,minutes,rate,amount,pack_id,location,currency,status) VALUES (?,?,?,?,?,?,?,?,?,'scheduled')",repeated).lastrowid)
-    result['count'] = repeat_count
+    result['count'] = len(result['ids'])
+    result['created_count'] = len(result['ids'])-(1 if old else 0)
     if repeat_count > 1:
         series = old.get('series_id') if old else None
         series = series or uuid.uuid4().hex
@@ -288,14 +332,13 @@ def edit_following_lessons(db, data):
     original = row(db,'lessons',data.get('id'))
     if original['status'] != 'scheduled':
         raise ValueError('Only planned lessons can be edited.')
-    if integer(data.get('repeat_count',1),'Number of weekly lessons',1,52) != 1:
-        raise ValueError('Edit the existing series separately from adding more weekly lessons.')
+    repeat_count = integer(data.get('repeat_count',4 if data.get('repeat') == 'weekly' else 1),'Number of weekly lessons',1,52)
     if not original['series_id']:
         return save_lesson(db,data)
     targets = [dict(r) for r in db.execute("SELECT * FROM lessons WHERE series_id=? AND status='scheduled' AND start>=? ORDER BY start,id",(original['series_id'],original['start']))]
     ids = {r['id'] for r in targets}
     # Normalize through the same validation used for individual lessons.
-    result = save_lesson(db,data,ids)
+    result = save_lesson(db,{**data,'repeat_count':1},ids)
     updated = row(db,'lessons',original['id'])
     delta = datetime.fromisoformat(updated['start'])-datetime.fromisoformat(original['start'])
     changes = {key:updated[key] for key in ('student_id','title','minutes','rate','pack_id','location') if updated[key] != original[key]}
@@ -316,12 +359,38 @@ def edit_following_lessons(db, data):
             difference = (start-datetime.fromisoformat(other['start'])).total_seconds()/60
             if difference < other['minutes'] and difference > -lesson['minutes']:
                 raise ValueError('The updated lessons would overlap each other. No changes were saved.')
-    for pack_id in {l['pack_id'] for l in planned if l['pack_id']}:
-        used = db.execute("SELECT COUNT(*) FROM lessons WHERE pack_id=? AND status!='cancelled'",(pack_id,)).fetchone()[0]
-        if used > row(db,'packs',pack_id)['quantity']:
-            raise ValueError('The pack does not have enough sessions for all these lessons. No changes were saved.')
+    if repeat_count > 1:
+        result = save_lesson(db,data)
     result['updated_count'] = len(ids)
     return result
+
+def record_payment(db, data):
+    kind = data.get('kind')
+    if kind not in ('lesson','pack','student'):
+        raise ValueError('Choose a student, lesson, or credit pack.')
+    item = row(db,{'lesson':'lessons','pack':'packs','student':'students'}[kind],data.get('id'))
+    currency = currency_code(data.get('currency',item['currency'])) if kind == 'student' else item['currency']
+    amount = money(data.get('amount'),currency)
+    if amount <= 0:
+        raise ValueError('Payment must be greater than zero.')
+    if kind == 'lesson':
+        if item['status'] != 'completed':
+            raise ValueError('Only completed lessons can receive payments.')
+        charge = next(c for c in state(db)['billing']['charges'] if c['id'] == item['id'])
+        if amount > charge['due']:
+            raise ValueError('Payment cannot exceed the remaining balance after student credit.')
+    elif kind == 'pack':
+        paid = db.execute('SELECT COALESCE(SUM(amount),0) FROM payments WHERE pack_id=?',(item['id'],)).fetchone()[0]
+        if amount > item['price']-paid:
+            raise ValueError('Payment cannot exceed the remaining pack amount.')
+    try:
+        date = datetime.strptime(data.get('date',''),'%Y-%m-%d').date().isoformat()
+    except (ValueError,TypeError):
+        raise ValueError('Choose a valid payment date.')
+    return db.execute('INSERT INTO payments(student_id,lesson_id,pack_id,amount,date,method,currency) VALUES (?,?,?,?,?,?,?)',
+        (item['id'] if kind == 'student' else item['student_id'],item['id'] if kind == 'lesson' else None,
+         item['id'] if kind == 'pack' else None,amount,date,required(data.get('method'),'Payment method',100),currency)).lastrowid
+
 
 def write(action, data):
     with database() as db:
@@ -343,6 +412,8 @@ def write(action, data):
             if student['archived']:
                 raise ValueError('Restore this student before adding a pack.')
             result['id'] = db.execute('INSERT INTO packs(student_id,name,quantity,minutes,price,created,currency) VALUES (?,?,?,?,?,?,?)', (student['id'], required(data.get('name'),'Pack name'), integer(data.get('quantity'),'Number of lessons',1,1000), integer(data.get('minutes'),'Duration',5,720), money(data.get('price'),student['currency']), datetime.now().isoformat(timespec='seconds'),student['currency'])).lastrowid
+            if data.get('received'):
+                result['payment_id'] = record_payment(db,dict(data,kind='pack',id=result['id'],amount=data.get('price')))
         elif action == 'lesson':
             result = edit_following_lessons(db,data) if data.get('edit_scope') == 'following' else save_lesson(db,data)
         elif action == 'lesson-status':
@@ -357,23 +428,7 @@ def write(action, data):
                     raise ValueError('A paid lesson cannot be cancelled or reopened. Remove its payment first.')
                 db.execute('UPDATE lessons SET status=? WHERE id=?',(status,lesson['id']))
         elif action == 'payment':
-            kind = data.get('kind')
-            if kind not in ('lesson','pack'):
-                raise ValueError('Choose a lesson or pack.')
-            item = row(db,'lessons' if kind == 'lesson' else 'packs',data.get('id'))
-            if kind == 'lesson' and (item['status'] != 'completed' or item['pack_id']):
-                raise ValueError('Only completed, individually billed lessons can receive payments.')
-            column = kind+'_id'
-            paid = db.execute(f'SELECT COALESCE(SUM(amount),0) FROM payments WHERE {column}=?',(item['id'],)).fetchone()[0]
-            due = item['amount' if kind == 'lesson' else 'price']-paid
-            amount = money(data.get('amount'),item['currency'])
-            if amount <= 0 or amount > due:
-                raise ValueError('Payment must be greater than zero and no more than the remaining balance.')
-            try:
-                date = datetime.strptime(data.get('date',''),'%Y-%m-%d').date().isoformat()
-            except (ValueError, TypeError):
-                raise ValueError('Choose a valid payment date.')
-            result['id'] = db.execute(f'INSERT INTO payments({column},amount,date,method,currency) VALUES (?,?,?,?,?)',(item['id'],amount,date,required(data.get('method'),'Payment method',100),item['currency'])).lastrowid
+            result['id'] = record_payment(db,data)
         elif action == 'delete-payment':
             row(db,'payments',data.get('id'))
             db.execute('DELETE FROM payments WHERE id=?',(data['id'],))
@@ -445,7 +500,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = self.path.split('?')[0]
         try:
-            if path == '/api/state':
+            if path == '/api/desktop-health':
+                self.send(200,desktop_identity())
+            elif path == '/api/state':
                 with database() as db:
                     self.send(200,state(db))
             elif path == '/api/backup':
@@ -482,15 +539,10 @@ class Handler(BaseHTTPRequestHandler):
                 def safe(value):
                     value = str(value)
                     return "'"+value if value.startswith(('=','+','-','@','\t','\r')) else value
-                for kind,items in [('lesson',records['lessons']),('pack',records['packs'])]:
-                    for item in items:
-                        if kind == 'lesson' and (item['status'] != 'completed' or item['pack_id']):
-                            continue
-                        writer.writerow([kind,item['id'],safe(students[item['student_id']]),safe(item.get('title',item.get('name'))),item.get('start',item.get('created'))[:10],f"{item.get('amount',item.get('price'))/100:.2f}",'',item['currency'],*conversion_columns(item.get('amount',item.get('price')),item['currency'])])
+                for item in records['billing']['charges']:
+                    writer.writerow(['lesson',item['id'],safe(students[item['student_id']]),safe(item['title']),item['start'][:10],f"{item['amount']/100:.2f}",'',item['currency'],*conversion_columns(item['amount'],item['currency'])])
                 for payment in records['payments']:
-                    kind = 'lesson' if payment['lesson_id'] else 'pack'
-                    item = next(i for i in records['lessons' if kind == 'lesson' else 'packs'] if i['id'] == payment[kind+'_id'])
-                    writer.writerow(['payment',payment['id'],safe(students[item['student_id']]),safe(payment['method']),payment['date'],'',f"{payment['amount']/100:.2f}",payment['currency'],*conversion_columns(payment['amount'],payment['currency'],True)])
+                    writer.writerow(['payment',payment['id'],safe(students[payment['student_id']]),safe(payment['method']),payment['date'],'',f"{payment['amount']/100:.2f}",payment['currency'],*conversion_columns(payment['amount'],payment['currency'],True)])
                 self.send(200,'\ufeff'+output.getvalue(),'text/csv; charset=utf-8',{'Content-Disposition':'attachment; filename="tutortrack-accounts.csv"'})
             else:
                 if path.startswith('/uploads/'):
