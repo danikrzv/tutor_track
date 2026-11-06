@@ -276,6 +276,15 @@ class TutorTrackTests(unittest.TestCase):
                 self.assertEqual(db.execute('PRAGMA integrity_check').fetchone()[0],'ok')
                 db.close()
 
+    def test_lesson_note_topic_is_optional_but_general_note_title_is_required(self):
+        lesson = self.lesson()
+        note = server.write('note', {'lesson_id':lesson,'title':'','body':'Lesson progress'})['id']
+        saved = next(item for item in self.get()['notes'] if item['id'] == note)
+        self.assertEqual(saved['title'],'')
+        self.assertEqual(saved['body'],'Lesson progress')
+        with self.assertRaisesRegex(ValueError,'Note title'):
+            server.write('note', {'title':'','body':'General planning'})
+
     def test_validation_and_rollback(self):
         for value in ('NaN','Infinity','-1','1.001'):
             with self.assertRaises(ValueError):

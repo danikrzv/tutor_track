@@ -440,7 +440,9 @@ def write(action, data):
             if lesson_id:
                 lesson = row(db,'lessons',lesson_id)
                 student_id = lesson['student_id']
-            title = required(data.get('title'),'Note title')
+            title = str(data.get('title') or '').strip() if lesson_id else required(data.get('title'),'Note title')
+            if len(title) > 300:
+                raise ValueError('Note title must be 300 characters or fewer.')
             body = str(data.get('body',''))
             if len(body) > 500000:
                 raise ValueError('This note is too long.')

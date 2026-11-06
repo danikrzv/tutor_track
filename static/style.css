@@ -28,3 +28,54 @@
 .calendar-period-title{margin:0;padding:14px 24px;background:#f8f7fc;color:var(--purple-dark);font-size:13px;border-top:1px solid var(--line)}
 .calendar-scroll .week-grid{min-height:360px}
 @media(max-width:700px){.calendar-scroll{height:65vh;min-height:320px}.calendar-scroll .week-grid{min-height:0}.calendar-period-title{padding:12px 15px}}
+
+/* Student-centered notebook */
+.note-filters{display:grid;gap:12px;padding:20px 18px 12px}
+.note-filters .search-box{max-width:none}
+.note-student-filter{display:grid;gap:7px;color:var(--muted);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.7px}
+.note-student-filter select{width:100%;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);padding:10px 11px;text-transform:none;letter-spacing:0;font-size:12px}
+.lesson-note-title{margin:0 30px 15px;font-size:28px;font-weight:650;letter-spacing:-.8px;color:var(--ink);overflow-wrap:anywhere}
+.note-topic-label{display:grid;gap:7px;margin:0 30px 18px;color:var(--muted);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.7px}
+.note-topic{width:100%;border:0;border-bottom:1px solid var(--line);padding:7px 0 10px;background:transparent;color:var(--ink);font-size:16px;text-transform:none;letter-spacing:0}
+.panel-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+
+/* Overview calendar preview */
+.stats .stat[data-nav]{font:inherit;color:inherit;text-align:left;cursor:pointer;transition:box-shadow .2s,transform .2s}
+.stats .stat[data-nav]:hover{box-shadow:0 7px 20px #42396f12;transform:translateY(-1px)}
+.stats .stat[data-nav]:focus-visible{outline:3px solid #b8a9f3;outline-offset:3px}
+.overview-week-preview{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));border-top:1px solid var(--line);flex:1;min-width:0}
+.overview-week-day{min-width:0;border-right:1px solid var(--line);background:#fff}
+.overview-week-day:last-child{border-right:0}
+.overview-week-day.is-today{background:#fcfaff}
+.overview-week-day-header{width:100%;border:0;border-bottom:1px solid var(--line);background:transparent;padding:15px 6px 13px;text-align:center;color:#9a96a8}
+.overview-week-day-header:hover{background:var(--purple-bg);color:var(--purple)}
+.overview-week-day-header span{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.6px}
+.overview-week-day-header strong{display:block;color:var(--ink);font-size:19px;font-weight:600;margin-top:6px}
+.overview-week-day.is-today .overview-week-day-header strong{color:var(--purple)}
+.overview-week-events{display:flex;flex-direction:column;gap:7px;padding:10px 7px;min-height:190px}
+.overview-week-events .calendar-event{width:100%;padding:9px 7px;display:block;text-align:left;border-radius:7px;overflow:hidden}
+.overview-week-events .calendar-event>span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.overview-week-events .calendar-event strong,.overview-week-events .calendar-event small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.overview-week-empty{color:#c1bdc9;font-size:11px;text-align:center;padding-top:14px}
+.payments-panel{min-width:0}
+.payments-panel .table-wrap{height:calc(100% - 76px)}
+.overview-secondary{display:grid;grid-template-columns:minmax(0,1fr);gap:24px}
+
+@media(max-width:1100px){
+ .overview-grid{grid-template-columns:1fr}
+ .payments-panel .table-wrap{height:auto}
+}
+@media(max-width:760px){
+ .overview-week-preview{grid-template-columns:repeat(2,minmax(0,1fr))}
+ .overview-week-day:nth-child(2n){border-right:0}
+ .overview-week-day:nth-child(n+3){border-top:1px solid var(--line)}
+ .overview-week-day-header{padding-block:12px}
+ .overview-week-events{min-height:120px}
+ .payments-panel .table-wrap{height:auto}
+}
+@media(max-width:480px){
+ .overview-week-preview{grid-template-columns:1fr}
+ .overview-week-day,.overview-week-day:nth-child(2n){border-right:0;border-top:1px solid var(--line)}
+ .overview-week-day:first-child{border-top:0}
+ .overview-week-events{min-height:0}
+}

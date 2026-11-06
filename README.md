@@ -93,6 +93,10 @@ Choose **Settings & backup → Time format** for a 12-hour clock with AM/PM or a
 
 Use the notebook for general notes, student notes, or a note attached to a particular lesson. Save with **Save note**, **Cmd+S**, or **Ctrl+S**. The app warns before leaving a note with unsaved changes.
 
+Lesson notes are named automatically with the student and lesson date, for example **Masha · 24 Oct**, and are ordered by lesson date with the newest first. Their existing title is kept as an optional topic beneath that name. Notes that are not attached to a lesson keep their normal editable title and are ordered by their last update.
+
+Use the **Student** filter together with search to show one student's notes, all students, or general notes. Archived students remain available when they have notes. From a student profile, choose **View all notes** to open the notebook already filtered to that student, or select an individual note to open it directly.
+
 The editor supports Markdown headings, bold, italics, strikethrough, bullet lists, checkboxes, blockquotes, fenced code, and links. Use `[[Exact note title]]` to link to another saved note. The **Preview** tab shows the formatted version. Raw HTML does not execute. This is a lightweight Markdown notebook, not a full Obsidian vault or plugin system.
 
 Attach PNG, JPEG, GIF, or WebP images (up to 10 MB each), or paste an image from the clipboard into the editor. Images are stored locally. Markdown may also reference HTTPS images; those images require internet access and are loaded from their original host.
